@@ -78,4 +78,4 @@ $ ./kvm-vm-password -user debian -password mynewuserpass -image /path/to/vm/imag
 
 ## License
 
-This project is open-source and available under the [MIT License](https://opensource.org/licenses/MIT).
+This project is licensed under the [MIT License](./LICENSE).
