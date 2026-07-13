@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -17,22 +19,34 @@ type DomainDisk struct {
 }
 
 type Domain struct {
-	XMLName xml.Name     `xml:"domain"`
+	XMLName xml.Name `xml:"domain"`
 	Devices struct {
 		Disks []DomainDisk `xml:"disk"`
 	} `xml:"devices"`
 }
 
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	rootFlag := flag.Bool("root", false, "Change root password")
 	userFlag := flag.String("user", "", "Username to change password for")
-	passwordFlag := flag.String("password", "", "New password")
+	passwordFileFlag := flag.String("password-file", "", "Path to a file whose first line is the new password")
 	imageFlag := flag.String("image", "", "Path to the KVM image")
+	versionFlag := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
-	if *passwordFlag == "" || (flag.NArg() == 0 && *imageFlag == "") {
+	if *versionFlag {
+		fmt.Printf("kvm-vm-password %s (commit %s, built %s)\n", version, commit, date)
+		return
+	}
+
+	if *passwordFileFlag == "" || (flag.NArg() == 0 && *imageFlag == "") {
 		fmt.Println("Missing required arguments")
-		fmt.Println("Usage: kvm-vm-password (-root | -user <username>) -password <new_password> (-image <image_path> | <vm_name>)")
+		fmt.Println("Usage: kvm-vm-password (-root | -user <username>) -password-file <path> (-image <image_path> | <vm_name>)")
 		os.Exit(1)
 	}
 
@@ -47,34 +61,27 @@ func main() {
 		os.Exit(1)
 	}
 
-	var targetImage string
-	var err error
+	passwordFile, err := filepath.Abs(*passwordFileFlag)
+	if err != nil {
+		fmt.Printf("Failed to resolve password file path: %v\n", err)
+		os.Exit(1)
+	}
 
-	if *imageFlag != "" {
-		targetImage = *imageFlag
-		fmt.Printf("Using specified image: %s\n", targetImage)
-		if err := verifyImageBelongsToVM(targetImage); err != nil {
-			fmt.Printf("Verification failed: %v\n", err)
-			os.Exit(1)
-		}
-	} else {
-		vmName := flag.Arg(0)
-		if !isVMStopped(vmName) {
-			fmt.Printf("The VM '%s' is currently running. Please stop it before changing the password.\n", vmName)
-			os.Exit(1)
-		}
-		targetImage, err = getVMDiskPath(vmName)
-		if err != nil {
-			fmt.Printf("Failed to get disk path for VM '%s': %v\n", vmName, err)
-			os.Exit(1)
-		}
-		fmt.Printf("Using disk of VM '%s': %s\n", vmName, targetImage)
+	vmName, targetImage, err := resolveTarget(*imageFlag, flag.Arg(0))
+	if err != nil {
+		fmt.Printf("%v\n", err)
+		os.Exit(1)
+	}
+
+	if !isVMStopped(vmName) {
+		fmt.Printf("The VM '%s' is currently running. Please stop it before changing the password.\n", vmName)
+		os.Exit(1)
 	}
 
 	if *rootFlag {
-		err = changeRootPassword(targetImage, *passwordFlag)
+		err = changeRootPassword(targetImage, passwordFile)
 	} else {
-		err = changeUserPassword(targetImage, *userFlag, *passwordFlag)
+		err = changeUserPassword(targetImage, *userFlag, passwordFile)
 	}
 
 	if err != nil {
@@ -85,21 +92,40 @@ func main() {
 	fmt.Println("Password changed successfully.")
 }
 
-func changeRootPassword(imagePath, password string) error {
+func resolveTarget(imagePath, vmName string) (string, string, error) {
+	if imagePath != "" {
+		fmt.Printf("Using specified image: %s\n", imagePath)
+		owner, err := findVMByImage(imagePath)
+		if err != nil {
+			return "", "", err
+		}
+		fmt.Printf("Image '%s' belongs to VM '%s'\n", imagePath, owner)
+		return owner, imagePath, nil
+	}
+
+	diskPath, err := getVMDiskPath(vmName)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get disk path for VM '%s': %w", vmName, err)
+	}
+	fmt.Printf("Using disk of VM '%s': %s\n", vmName, diskPath)
+	return vmName, diskPath, nil
+}
+
+func changeRootPassword(imagePath, passwordFile string) error {
 	args := []string{
 		"virt-customize",
 		"-a", imagePath,
-		"--root-password", fmt.Sprintf("password:%s", password),
+		"--root-password", fmt.Sprintf("file:%s", passwordFile),
 	}
 
 	return runVirtCustomize(args)
 }
 
-func changeUserPassword(imagePath, username, password string) error {
+func changeUserPassword(imagePath, username, passwordFile string) error {
 	args := []string{
 		"virt-customize",
 		"-a", imagePath,
-		"--password", fmt.Sprintf("%s:password:%s", username, password),
+		"--password", fmt.Sprintf("%s:file:%s", username, passwordFile),
 	}
 
 	return runVirtCustomize(args)
@@ -129,12 +155,7 @@ func isVMStopped(vmName string) bool {
 	}
 
 	runningVMs := strings.Split(strings.TrimSpace(string(output)), "\n")
-	for _, vm := range runningVMs {
-		if vm == vmName {
-			return false
-		}
-	}
-	return true
+	return !slices.Contains(runningVMs, vmName)
 }
 
 func getVMDiskPath(vmName string) (string, error) {
@@ -157,11 +178,11 @@ func getVMDiskPath(vmName string) (string, error) {
 	return domain.Devices.Disks[0].Source.File, nil
 }
 
-func verifyImageBelongsToVM(imagePath string) error {
+func findVMByImage(imagePath string) (string, error) {
 	cmd := exec.Command("sudo", "virsh", "list", "--name", "--all")
 	output, err := cmd.Output()
 	if err != nil {
-		return fmt.Errorf("failed to get list of all VMs: %w", err)
+		return "", fmt.Errorf("failed to get list of all VMs: %w", err)
 	}
 
 	allVMs := strings.Split(strings.TrimSpace(string(output)), "\n")
@@ -171,15 +192,12 @@ func verifyImageBelongsToVM(imagePath string) error {
 			fmt.Printf("Warning: Failed to get disks for VM '%s': %v\n", vm, err)
 			continue
 		}
-		for _, disk := range disks {
-			if disk == imagePath {
-				fmt.Printf("Image '%s' belongs to VM '%s'\n", imagePath, vm)
-				return nil
-			}
+		if slices.Contains(disks, imagePath) {
+			return vm, nil
 		}
 	}
 
-	return fmt.Errorf("the specified image '%s' is not connected to any known VM", imagePath)
+	return "", fmt.Errorf("the specified image '%s' is not connected to any known VM", imagePath)
 }
 
 func getVMDisks(vmName string) ([]string, error) {
